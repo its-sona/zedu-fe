@@ -1,10 +1,10 @@
 # Zedu APP
 
-Zedu is a cross-platform collaboration system that consolidates messaging, channels, calls, file sharing, search, and AI coworkers into a unified workspace. It is designed to eliminate fragmentation across tools, reduce context switching, and enable teams to collaborate in real time with intelligent assistance and consistent performance across Web, Mobile, and Desktop.
+Zedu is a cross-platform collaboration system that combines messaging, channels, calls, file sharing, search, and AI coworkers into a unified workspace. It is designed to eliminate fragmentation across tools, reduce context switching, and enable teams to collaborate in real time with intelligent assistance and consistent performance across Web, Mobile, and Desktop.
 
 ## Overview
 
-Modern teams depend on multiple disconnected tools: chat apps, conferencing tools, wikis, file sharing apps, and standalone AI assistants. This creates inefficiency and loss of context. Zedu provides a single, structured environment where users, teams, and AI colleagues can work together seamlessly.
+Modern teams rely on multiple disconnected tools: chat apps, conferencing tools, wikis, file sharing apps, and standalone AI assistants. This creates inefficiency and loss of context. Zedu provides a single, structured environment where users, teams, and AI colleagues can work together seamlessly.
 
 The platform supports:
 
