@@ -78,6 +78,31 @@ write_state() { # pr state sha tag host dep message [comment id]
   else
     gh api "repos/$REPO/issues/$1/comments" -f body="$body" >/dev/null
   fi
+  label_sync "$1" "$pst" "$2"
+}
+
+# Labels index the PRs that hold a preview slot, so counting and sweeping cost one listing instead of
+# a state read per open PR. Adding a missing label creates it.
+LIVE=preview-live QUEUED=preview-queued
+label_for() { case "$1" in active) echo "$LIVE" ;; queued) echo "$QUEUED" ;; esac; }
+label_sync() { # pr old-state new-state
+  local want had
+  want=$(label_for "$3"); had=$(label_for "$2")
+  if dry; then echo "  [dry-run] PR #$1 labels: ${had:--} -> ${want:--}" >&2; return 0; fi
+  [ -n "$want" ] && gh api -X POST "repos/$REPO/issues/$1/labels" -f "labels[]=$want" >/dev/null
+  if [ -n "$had" ] && [ "$had" != "$want" ]; then
+    gh api -X DELETE "repos/$REPO/issues/$1/labels/$had" >/dev/null 2>&1 || true
+  fi
+  return 0
+}
+
+# PR numbers carrying a label, open or closed (a closed PR still labelled live holds a container).
+labelled() { gh api --paginate "repos/$REPO/issues?state=all&labels=$1&per_page=100" --jq '.[].number'; }
+
+# Normalised Backend URL line of a PR body, unvalidated; empty when there's none.
+bline() {
+  printf '%s\n' "$1" | tr -d '\r' | grep -iE '^[[:space:]]*backend url:' | head -1 \
+    | sed -E 's/^[[:space:]]*[Bb][Aa][Cc][Kk][Ee][Nn][Dd] [Uu][Rr][Ll]:[[:space:]]*//; s/[[:space:]`<>]//g; s#/+$##' || true
 }
 
 # Backend host from the PR body (trusted API read), or the default. Prints "<host> <override>" or fails.
@@ -91,10 +116,10 @@ backend() {
   echo "${BASH_REMATCH[1]} true"
 }
 
-# Every open PR's active previews, oldest first: "<at> <pr>".
+# Active previews, oldest first: "<at> <pr>". Reads state only for labelled PRs (at most ~CAP).
 active_previews() {
   local n
-  for n in $(gh api --paginate "repos/$REPO/pulls?state=open&base=dev&per_page=100" --jq '.[].number'); do
+  for n in $(labelled "$LIVE"); do
     read_state "$n" | awk -v n="$n" '$2 == "active" { print $7, n }'
   done | sort -n
 }
@@ -120,7 +145,7 @@ gate_of() { # head-repo labels-json -> reviewer|registered|label|skip
 
 # Runs on the PR event itself (trusted, pull_request_target), so Preview shows up next to the other
 # checks while the build is still running instead of only once the deploy starts.
-queued() { # pr; env ACTION, LABEL, BODY_CHANGED from the event
+queued() { # pr; env ACTION, LABEL, BODY_CHANGED, BODY_FROM from the event
   [ "$(cfg PREVIEW_ENABLED)" = true ] || return 0
   case "${ACTION:-}" in
     edited) [ "${BODY_CHANGED:-}" = true ] || return 0 ;;
@@ -128,6 +153,10 @@ queued() { # pr; env ACTION, LABEL, BODY_CHANGED from the event
   esac
   local pull sha org gate host id st ssha shost
   pull=$(gh api "repos/$REPO/pulls/$1")
+  # Same filter as the build's `relevant` job: a body edit only matters if the Backend URL line changed.
+  if [ "${ACTION:-}" = edited ] && [ "$(bline "${BODY_FROM:-}")" = "$(bline "$(jq -r '.body // ""' <<< "$pull")")" ]; then
+    return 0
+  fi
   [ "$(jq -r .draft <<< "$pull")" = false ] || return 0
   sha=$(jq -r .head.sha <<< "$pull"); org=$(jq -r '.head.repo.full_name // "" | split("/")[0]' <<< "$pull")
   gate=$(gate_of "$(jq -r '.head.repo.full_name // ""' <<< "$pull")" "$(jq -c '[.labels[].name]' <<< "$pull")")
@@ -243,7 +272,7 @@ deploy() { # head-sha image
   fi
 
   # Cap: this PR's own slot is reused; otherwise evict the oldest. A failed delete frees nothing.
-  local running; running=$(active_previews | awk -v p="$pr" '$2 != p' | wc -l | tr -d ' ')
+  local running; running=$(labelled "$LIVE" | grep -vxc "$pr" || true)
   if (( running >= CAP )); then
     local oldest; oldest=$(active_previews | awk -v p="$pr" '$2 != p { print $2; exit }')
     [ -n "$oldest" ] && remove "$oldest" evicted "Stopped to free a slot (cap: $CAP). Push a commit or ask a reviewer for the \`preview\` label to bring it back." \
@@ -275,6 +304,10 @@ watch() { # deployment-uuid -> result=<status> in GITHUB_OUTPUT; writes nothing 
 # Runs under the per-PR lock (fe-preview-pr-<N>): a newer deployment for the same PR wins.
 settle() { # pr sha deployment result
   local id st sha tag host dep at
+  # This job may have replaced a waiting close for the same PR (one waiting job per lock).
+  if [ "$(gh api "repos/$REPO/pulls/$1" --jq .state)" != open ]; then
+    echo "PR #$1 closed while deploying; cleaning up."; close "$1"; return 0
+  fi
   read -r id st sha tag host dep at <<< "$(read_state "$1")"
   if [ "$st" != active ] || [ "$dep" != "$3" ]; then
     echo "PR #$1: deployment $3 was superseded or removed; leaving Preview alone."; return 0
@@ -305,9 +338,21 @@ close() { # pr
 }
 
 sweep() {
-  local n id st sha tag host dep at s
-  for n in $(gh api --paginate "repos/$REPO/pulls?state=open&base=dev&sort=created&direction=asc&per_page=100" --jq '.[].number'); do
+  local n id st sha tag host dep at s live queue free pstate
+  live=$(labelled "$LIVE"); queue=$(labelled "$QUEUED")
+  free=$(( CAP - $(grep -c . <<< "$live" || true) ))
+  # Oldest PR first, so queued previews start in order.
+  for n in $(printf '%s\n%s\n' "$live" "$queue" | grep . | sort -nu); do
     read -r id st sha tag host dep at <<< "$(read_state "$n")"
+    pstate=$(gh api "repos/$REPO/pulls/$n" --jq .state)
+    if [ "$pstate" != open ]; then
+      # Closed with a slot still held: a close that never ran, or failed to delete.
+      case "$st" in
+        active) remove "$n" removed "Removed: PR closed." && free=$(( free + 1 )) ;;
+        queued) write_state "$n" removed "$sha" "$tag" "$host" - "Queue entry dropped: PR closed." "$id" ;;
+      esac
+      continue
+    fi
     case "$st" in
       active)
         if (( NOW - at > TTL_H * 3600 )); then
@@ -324,7 +369,7 @@ sweep() {
           esac
         fi ;;
       queued)
-        (( $(active_previews | wc -l) < CAP )) || continue
+        (( free > 0 )) || continue
         # Re-check what was true at queue time: head, gate and backend may have changed since.
         local pull why="" bhost
         pull=$(gh api "repos/$REPO/pulls/$n")
@@ -335,19 +380,20 @@ sweep() {
         if [ -n "$why" ]; then
           write_state "$n" removed "$sha" "$tag" "$host" - "Queue entry dropped: $why. The next build re-queues it if it still qualifies." "$id"
         else
-          deploy_tag "$n" "$sha" "$tag" "$host" "$id" || true
+          deploy_tag "$n" "$sha" "$tag" "$host" "$id" && free=$(( free - 1 ))
         fi ;;
     esac
   done
-  # A failed delete on close leaves a closed PR's preview active; retry those for two weeks.
-  # Hourly only (first sweep of the hour): ~100+ closed PRs cost one API call each.
-  (( 10#$(date -u +%M) < 15 )) || [ -n "${SWEEP_CLOSED:-}" ] || return 0
-  for n in $(gh api --paginate "repos/$REPO/pulls?state=closed&base=dev&per_page=100" \
-    --jq '.[] | select(.closed_at and ((.closed_at | fromdateiso8601) > (now - 1209600))) | .number'); do
-    read -r _ st _ <<< "$(read_state "$n")"
-    [ "$st" = active ] && { remove "$n" removed "Removed: PR closed." || true; }
-  done
   return 0
+}
+
+# One-off: label PRs whose previews predate the labels (reads state for every open PR once).
+relabel() {
+  local n st
+  for n in $(gh api --paginate "repos/$REPO/pulls?state=open&base=dev&per_page=100" --jq '.[].number'); do
+    read -r _ st _ <<< "$(read_state "$n")"
+    case "$st" in active|queued) echo "PR #$n: $st"; label_sync "$n" - "$st" ;; esac
+  done
 }
 
 case "${1:-}" in
@@ -359,5 +405,6 @@ case "${1:-}" in
   settle) settle "${2:?pr}" "${3:?sha}" "${4:?deployment}" "${5:?result}" ;;
   close) [[ "${2:-}" =~ ^[0-9]+$ ]] || { echo "Usage: $0 close <pr>" >&2; exit 1; }; close "$2" ;;
   sweep) sweep ;;
+  relabel) relabel ;;
   *) echo "Usage: $0 deploy <sha> <image> [host] | watch <deployment> | settle <pr> <sha> <deployment> <result> | close <pr> | sweep" >&2; exit 1 ;;
 esac
