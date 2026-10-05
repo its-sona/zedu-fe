@@ -47,8 +47,13 @@ jobs:
     steps:
       - id: check
         run: |
-          bline() { printf '%s\n' "$1" | tr -d '\r' | grep -iE '^[[:space:]]*backend url:' | head -1 \
-            | sed -E 's/^[[:space:]]*[Bb][Aa][Cc][Kk][Ee][Nn][Dd] [Uu][Rr][Ll]:[[:space:]]*//; s/[[:space:]`<>]//g; s#/+$##' || true; }
+          # Same as bline() in fe-preview.sh: "none" when absent, so removing the line counts as a change.
+          bline() {
+            local l
+            l=$(printf '%s\n' "$1" | tr -d '\r' | grep -iE '^[[:space:]]*backend url:' | head -1 || true)
+            [ -n "$l" ] || { echo none; return 0; }
+            echo "line:$(sed -E 's/^[[:space:]]*[Bb][Aa][Cc][Kk][Ee][Nn][Dd] [Uu][Rr][Ll]:[[:space:]]*//; s/[[:space:]`<>]//g; s#/+$##' <<< "$l")"
+          }
           go=true
           case "$ACTION" in
             labeled) [ "$LABEL" = preview ] || go=false ;;

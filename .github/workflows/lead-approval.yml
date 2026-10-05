@@ -152,6 +152,8 @@ jobs:
           fi
           # The effective review state per person is their latest non-comment review, across all pages.
           # gh can't combine --slurp with --jq (every run failed), so the pages are piped into jq.
+          # pipefail: an API failure must fail the step, not read as "no approvals".
+          set -o pipefail
           approved=$(gh api --paginate --slurp "repos/$REPO/pulls/$PR/reviews?per_page=100" \
             | jq -r 'flatten | map(select(.state != "COMMENTED" and .state != "PENDING")) | group_by(.user.login | ascii_downcase) | map(.[-1]) | map(select(.state == "APPROVED")) | .[].user.login')
           leads_list=$(printf '%s\n' "$LEADS" | tr ',' '\n' | grep -v '^$')

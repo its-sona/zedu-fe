@@ -85,24 +85,35 @@ write_state() { # pr state sha tag host dep message [comment id]
 # a state read per open PR. Adding a missing label creates it.
 LIVE=preview-live QUEUED=preview-queued
 label_for() { case "$1" in active) echo "$LIVE" ;; queued) echo "$QUEUED" ;; esac; }
-label_sync() { # pr old-state new-state
-  local want had
-  want=$(label_for "$3"); had=$(label_for "$2")
-  if dry; then echo "  [dry-run] PR #$1 labels: ${had:--} -> ${want:--}" >&2; return 0; fi
-  [ -n "$want" ] && gh api -X POST "repos/$REPO/issues/$1/labels" -f "labels[]=$want" >/dev/null
-  if [ -n "$had" ] && [ "$had" != "$want" ]; then
-    gh api -X DELETE "repos/$REPO/issues/$1/labels/$had" >/dev/null 2>&1 || true
+label_sync() { # pr old-state new-state; reconciles both labels against what the PR actually has
+  local want have l
+  want=$(label_for "$3")
+  if dry; then echo "  [dry-run] PR #$1 labels -> ${want:-none}" >&2; return 0; fi
+  if ! have=$(gh api "repos/$REPO/issues/$1/labels" --jq '.[].name'); then
+    echo "::warning::PR #$1: couldn't read labels; preview labels not reconciled."; return 0
   fi
+  if [ -n "$want" ] && ! grep -qxF "$want" <<< "$have"; then
+    gh api -X POST "repos/$REPO/issues/$1/labels" -f "labels[]=$want" >/dev/null \
+      || echo "::warning::PR #$1: couldn't add $want."
+  fi
+  for l in "$LIVE" "$QUEUED"; do
+    if [ "$l" = "$want" ] || ! grep -qxF "$l" <<< "$have"; then continue; fi
+    gh api -X DELETE "repos/$REPO/issues/$1/labels/$l" >/dev/null \
+      || echo "::warning::PR #$1: couldn't remove $l; it still counts toward the cap."
+  done
   return 0
 }
 
 # PR numbers carrying a label, open or closed (a closed PR still labelled live holds a container).
 labelled() { gh api --paginate "repos/$REPO/issues?state=all&labels=$1&per_page=100" --jq '.[].number'; }
 
-# Normalised Backend URL line of a PR body, unvalidated; empty when there's none.
+# Normalised Backend URL line of a PR body, unvalidated: "line:<value>", or "none" when absent, so
+# removing the line (back to the default backend) counts as a change.
 bline() {
-  printf '%s\n' "$1" | tr -d '\r' | grep -iE '^[[:space:]]*backend url:' | head -1 \
-    | sed -E 's/^[[:space:]]*[Bb][Aa][Cc][Kk][Ee][Nn][Dd] [Uu][Rr][Ll]:[[:space:]]*//; s/[[:space:]`<>]//g; s#/+$##' || true
+  local l
+  l=$(printf '%s\n' "$1" | tr -d '\r' | grep -iE '^[[:space:]]*backend url:' | head -1 || true)
+  [ -n "$l" ] || { echo none; return 0; }
+  echo "line:$(sed -E 's/^[[:space:]]*[Bb][Aa][Cc][Kk][Ee][Nn][Dd] [Uu][Rr][Ll]:[[:space:]]*//; s/[[:space:]`<>]//g; s#/+$##' <<< "$l")"
 }
 
 # Backend host from the PR body (trusted API read), or the default. Prints "<host> <override>" or fails.
@@ -305,7 +316,9 @@ watch() { # deployment-uuid -> result=<status> in GITHUB_OUTPUT; writes nothing 
 settle() { # pr sha deployment result
   local id st sha tag host dep at
   # This job may have replaced a waiting close for the same PR (one waiting job per lock).
-  if [ "$(gh api "repos/$REPO/pulls/$1" --jq .state)" != open ]; then
+  local pstate
+  pstate=$(gh api "repos/$REPO/pulls/$1" --jq .state) || { echo "::error::Couldn't read PR #$1; not settling."; return 1; }
+  if [ "$pstate" != open ]; then
     echo "PR #$1 closed while deploying; cleaning up."; close "$1"; return 0
   fi
   read -r id st sha tag host dep at <<< "$(read_state "$1")"
@@ -344,7 +357,8 @@ sweep() {
   # Oldest PR first, so queued previews start in order.
   for n in $(printf '%s\n%s\n' "$live" "$queue" | grep . | sort -nu); do
     read -r id st sha tag host dep at <<< "$(read_state "$n")"
-    pstate=$(gh api "repos/$REPO/pulls/$n" --jq .state)
+    # A failed lookup must never read as "closed": skip the PR rather than delete a live preview.
+    pstate=$(gh api "repos/$REPO/pulls/$n" --jq .state) || { echo "::warning::PR #$n: couldn't read state; skipped."; continue; }
     if [ "$pstate" != open ]; then
       # Closed with a slot still held: a close that never ran, or failed to delete.
       case "$st" in
@@ -356,7 +370,8 @@ sweep() {
     case "$st" in
       active)
         if (( NOW - at > TTL_H * 3600 )); then
-          remove "$n" expired "Expired after ${TTL_H}h without a push. Push a commit or ask a reviewer for the \`preview\` label to bring it back." || true
+          remove "$n" expired "Expired after ${TTL_H}h without a push. Push a commit or ask a reviewer for the \`preview\` label to bring it back." \
+            && free=$(( free + 1 ))
         elif [ "$dep" != - ]; then
           # Settle deployments the watch job didn't see finish.
           s=$(coolify GET "/deployments/$dep" | jq -r '.status // empty' 2>/dev/null || true)
